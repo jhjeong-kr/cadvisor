@@ -16,6 +16,7 @@ package collector
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"math"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/cadvisor/container"
 	"github.com/google/cadvisor/info/v1"
 )
 
@@ -35,15 +37,27 @@ type PrometheusCollector struct {
 
 	//holds information extracted from the config file for a collector
 	configFile Prometheus
+
+	// the metrics to gather (uses a map as a set)
+	metricsSet map[string]bool
+
+	// Limit for the number of scaped metrics. If the count is higher,
+	// no metrics will be returned.
+	metricCountLimit int
+
+	// The Http client to use when connecting to metric endpoints
+	httpClient *http.Client
 }
 
 //Returns a new collector using the information extracted from the configfile
-func NewPrometheusCollector(collectorName string, configFile []byte) (*PrometheusCollector, error) {
+func NewPrometheusCollector(collectorName string, configFile []byte, metricCountLimit int, containerHandler container.ContainerHandler, httpClient *http.Client) (*PrometheusCollector, error) {
 	var configInJSON Prometheus
 	err := json.Unmarshal(configFile, &configInJSON)
 	if err != nil {
 		return nil, err
 	}
+
+	configInJSON.Endpoint.configure(containerHandler)
 
 	minPollingFrequency := configInJSON.PollingFrequency
 
@@ -54,11 +68,30 @@ func NewPrometheusCollector(collectorName string, configFile []byte) (*Prometheu
 		minPollingFrequency = minSupportedFrequency
 	}
 
+	if metricCountLimit < 0 {
+		return nil, fmt.Errorf("Metric count limit must be greater than 0")
+	}
+
+	var metricsSet map[string]bool
+	if len(configInJSON.MetricsConfig) > 0 {
+		metricsSet = make(map[string]bool, len(configInJSON.MetricsConfig))
+		for _, name := range configInJSON.MetricsConfig {
+			metricsSet[name] = true
+		}
+	}
+
+	if len(configInJSON.MetricsConfig) > metricCountLimit {
+		return nil, fmt.Errorf("Too many metrics defined: %d limit %d", len(configInJSON.MetricsConfig), metricCountLimit)
+	}
+
 	//TODO : Add checks for validity of config file (eg : Accurate JSON fields)
 	return &PrometheusCollector{
 		name:             collectorName,
 		pollingFrequency: minPollingFrequency,
 		configFile:       configInJSON,
+		metricsSet:       metricsSet,
+		metricCountLimit: metricCountLimit,
+		httpClient:       httpClient,
 	}, nil
 }
 
@@ -82,7 +115,8 @@ func getMetricData(line string) string {
 
 func (collector *PrometheusCollector) GetSpec() []v1.MetricSpec {
 	specs := []v1.MetricSpec{}
-	response, err := http.Get(collector.configFile.Endpoint)
+
+	response, err := collector.httpClient.Get(collector.configFile.Endpoint.URL)
 	if err != nil {
 		return specs
 	}
@@ -94,14 +128,24 @@ func (collector *PrometheusCollector) GetSpec() []v1.MetricSpec {
 	}
 
 	lines := strings.Split(string(pageContent), "\n")
+	lineCount := len(lines)
 	for i, line := range lines {
 		if strings.HasPrefix(line, "# HELP") {
-			stopIndex := strings.Index(lines[i+2], "{")
+			if i+2 >= lineCount {
+				break
+			}
+
+			stopIndex := strings.IndexAny(lines[i+2], "{ ")
 			if stopIndex == -1 {
-				stopIndex = strings.Index(lines[i+2], " ")
+				continue
+			}
+
+			name := strings.TrimSpace(lines[i+2][0:stopIndex])
+			if _, ok := collector.metricsSet[name]; collector.metricsSet != nil && !ok {
+				continue
 			}
 			spec := v1.MetricSpec{
-				Name:   strings.TrimSpace(lines[i+2][0:stopIndex]),
+				Name:   name,
 				Type:   v1.MetricType(getMetricData(lines[i+1])),
 				Format: "float",
 				Units:  getMetricData(lines[i]),
@@ -117,8 +161,8 @@ func (collector *PrometheusCollector) Collect(metrics map[string][]v1.MetricVal)
 	currentTime := time.Now()
 	nextCollectionTime := currentTime.Add(time.Duration(collector.pollingFrequency))
 
-	uri := collector.configFile.Endpoint
-	response, err := http.Get(uri)
+	uri := collector.configFile.Endpoint.URL
+	response, err := collector.httpClient.Get(uri)
 	if err != nil {
 		return nextCollectionTime, nil, err
 	}
@@ -131,6 +175,8 @@ func (collector *PrometheusCollector) Collect(metrics map[string][]v1.MetricVal)
 
 	var errorSlice []error
 	lines := strings.Split(string(pageContent), "\n")
+
+	newMetrics := make(map[string][]v1.MetricVal)
 
 	for _, line := range lines {
 		if line == "" {
@@ -145,6 +191,9 @@ func (collector *PrometheusCollector) Collect(metrics map[string][]v1.MetricVal)
 			}
 
 			metName := strings.TrimSpace(line[0:startLabelIndex])
+			if _, ok := collector.metricsSet[metName]; collector.metricsSet != nil && !ok {
+				continue
+			}
 
 			if startLabelIndex+1 <= spaceIndex-1 {
 				metLabel = strings.TrimSpace(line[(startLabelIndex + 1):(spaceIndex - 1)])
@@ -163,8 +212,15 @@ func (collector *PrometheusCollector) Collect(metrics map[string][]v1.MetricVal)
 				FloatValue: metVal,
 				Timestamp:  currentTime,
 			}
-			metrics[metName] = append(metrics[metName], metric)
+			newMetrics[metName] = append(newMetrics[metName], metric)
+			if len(newMetrics) > collector.metricCountLimit {
+				return nextCollectionTime, nil, fmt.Errorf("too many metrics to collect")
+			}
 		}
 	}
+	for key, val := range newMetrics {
+		metrics[key] = append(metrics[key], val...)
+	}
+
 	return nextCollectionTime, metrics, compileErrors(errorSlice)
 }

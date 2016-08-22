@@ -23,6 +23,8 @@ type CpuSpec struct {
 	Limit    uint64 `json:"limit"`
 	MaxLimit uint64 `json:"max_limit"`
 	Mask     string `json:"mask,omitempty"`
+	Quota    uint64 `json:"quota,omitempty"`
+	Period   uint64 `json:"period,omitempty"`
 }
 
 type MemorySpec struct {
@@ -45,6 +47,8 @@ type ContainerSpec struct {
 
 	// Metadata labels associated with this container.
 	Labels map[string]string `json:"labels,omitempty"`
+	// Metadata envs associated with this container. Only whitelisted envs are added.
+	Envs map[string]string `json:"envs,omitempty"`
 
 	HasCpu bool    `json:"has_cpu"`
 	Cpu    CpuSpec `json:"cpu,omitempty"`
@@ -61,10 +65,16 @@ type ContainerSpec struct {
 
 	HasCustomMetrics bool         `json:"has_custom_metrics"`
 	CustomMetrics    []MetricSpec `json:"custom_metrics,omitempty"`
+
+	// Image name used for this container.
+	Image string `json:"image,omitempty"`
 }
 
 // Container reference contains enough information to uniquely identify a container
 type ContainerReference struct {
+	// The container id
+	Id string `json:"id,omitempty"`
+
 	// The absolute name of the container. This is unique on the machine.
 	Name string `json:"name"`
 
@@ -75,6 +85,8 @@ type ContainerReference struct {
 	// Namespace under which the aliases of a container are unique.
 	// An example of a namespace is "docker" for Docker containers.
 	Namespace string `json:"namespace,omitempty"`
+
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // Sorts by container name.
@@ -84,11 +96,10 @@ func (self ContainerReferenceSlice) Len() int           { return len(self) }
 func (self ContainerReferenceSlice) Swap(i, j int)      { self[i], self[j] = self[j], self[i] }
 func (self ContainerReferenceSlice) Less(i, j int) bool { return self[i].Name < self[j].Name }
 
-// ContainerInfoQuery is used when users check a container info from the REST api.
+// ContainerInfoRequest is used when users check a container info from the REST API.
 // It specifies how much data users want to get about a container
 type ContainerInfoRequest struct {
 	// Max number of stats to return. Specify -1 for all stats currently available.
-	// If start and end time are specified this limit is ignored.
 	// Default: 60
 	NumStats int `json:"num_stats,omitempty"`
 
@@ -255,7 +266,7 @@ type LoadStats struct {
 // CPU usage time statistics.
 type CpuUsage struct {
 	// Total CPU usage.
-	// Units: nanoseconds
+	// Unit: nanoseconds.
 	Total uint64 `json:"total"`
 
 	// Per CPU/core usage of the container.
@@ -263,17 +274,31 @@ type CpuUsage struct {
 	PerCpu []uint64 `json:"per_cpu_usage,omitempty"`
 
 	// Time spent in user space.
-	// Unit: nanoseconds
+	// Unit: nanoseconds.
 	User uint64 `json:"user"`
 
 	// Time spent in kernel space.
-	// Unit: nanoseconds
+	// Unit: nanoseconds.
 	System uint64 `json:"system"`
+}
+
+// Cpu Completely Fair Scheduler statistics.
+type CpuCFS struct {
+	// Total number of elapsed enforcement intervals.
+	Periods uint64 `json:"periods"`
+
+	// Total number of times tasks in the cgroup have been throttled.
+	ThrottledPeriods uint64 `json:"throttled_periods"`
+
+	// Total time duration for which tasks in the cgroup have been throttled.
+	// Unit: nanoseconds.
+	ThrottledTime uint64 `json:"throttled_time"`
 }
 
 // All CPU usage metrics are cumulative from the creation of the container
 type CpuStats struct {
 	Usage CpuUsage `json:"usage"`
+	CFS   CpuCFS   `json:"cfs"`
 	// Smoothed average of number of runnable threads x 1000.
 	// We multiply by thousand to avoid using floats, but preserving precision.
 	// Load is smoothed over the last 10 seconds. Instantaneous value can be read
@@ -304,10 +329,25 @@ type MemoryStats struct {
 	// Units: Bytes.
 	Usage uint64 `json:"usage"`
 
+	// Number of bytes of page cache memory.
+	// Units: Bytes.
+	Cache uint64 `json:"cache"`
+
+	// The amount of anonymous and swap cache memory (includes transparent
+	// hugepages).
+	// Units: Bytes.
+	RSS uint64 `json:"rss"`
+
+	// The amount of swap currently used by the processes in this cgroup
+	// Units: Bytes.
+	Swap uint64 `json:"swap"`
+
 	// The amount of working set memory, this includes recently accessed memory,
 	// dirty memory, and kernel memory. Working set is <= "usage".
 	// Units: Bytes.
 	WorkingSet uint64 `json:"working_set"`
+
+	Failcnt uint64 `json:"failcnt"`
 
 	ContainerData    MemoryStatsMemoryData `json:"container_data,omitempty"`
 	HierarchicalData MemoryStatsMemoryData `json:"hierarchical_data,omitempty"`
@@ -342,11 +382,43 @@ type InterfaceStats struct {
 type NetworkStats struct {
 	InterfaceStats `json:",inline"`
 	Interfaces     []InterfaceStats `json:"interfaces,omitempty"`
+	// TCP connection stats (Established, Listen...)
+	Tcp TcpStat `json:"tcp"`
+	// TCP6 connection stats (Established, Listen...)
+	Tcp6 TcpStat `json:"tcp6"`
+}
+
+type TcpStat struct {
+	//Count of TCP connections in state "Established"
+	Established uint64
+	//Count of TCP connections in state "Syn_Sent"
+	SynSent uint64
+	//Count of TCP connections in state "Syn_Recv"
+	SynRecv uint64
+	//Count of TCP connections in state "Fin_Wait1"
+	FinWait1 uint64
+	//Count of TCP connections in state "Fin_Wait2"
+	FinWait2 uint64
+	//Count of TCP connections in state "Time_Wait
+	TimeWait uint64
+	//Count of TCP connections in state "Close"
+	Close uint64
+	//Count of TCP connections in state "Close_Wait"
+	CloseWait uint64
+	//Count of TCP connections in state "Listen_Ack"
+	LastAck uint64
+	//Count of TCP connections in state "Listen"
+	Listen uint64
+	//Count of TCP connections in state "Closing"
+	Closing uint64
 }
 
 type FsStats struct {
 	// The block device name associated with the filesystem.
 	Device string `json:"device,omitempty"`
+
+	// Type of the filesytem.
+	Type string `json:"type"`
 
 	// Number of bytes that can be consumed by the container on this filesystem.
 	Limit uint64 `json:"capacity"`
@@ -354,8 +426,21 @@ type FsStats struct {
 	// Number of bytes that is consumed by the container on this filesystem.
 	Usage uint64 `json:"usage"`
 
+	// Base Usage that is consumed by the container's writable layer.
+	// This field is only applicable for docker container's as of now.
+	BaseUsage uint64 `json:"base_usage"`
+
 	// Number of bytes available for non-root user.
 	Available uint64 `json:"available"`
+
+	// HasInodes when true, indicates that Inodes info will be available.
+	HasInodes bool `json:"has_inodes"`
+
+	// Number of Inodes
+	Inodes uint64 `json:"inodes"`
+
+	// Number of available Inodes
+	InodesFree uint64 `json:"inodes_free"`
 
 	// Number of reads completed
 	// This is the total number of reads completed successfully.
@@ -442,17 +527,6 @@ func timeEq(t1, t2 time.Time, tolerance time.Duration) bool {
 	return false
 }
 
-func durationEq(a, b time.Duration, tolerance time.Duration) bool {
-	if a > b {
-		a, b = b, a
-	}
-	diff := a - b
-	if diff <= tolerance {
-		return true
-	}
-	return false
-}
-
 const (
 	// 10ms, i.e. 0.01s
 	timePrecision time.Duration = 10 * time.Millisecond
@@ -486,14 +560,6 @@ func (a *ContainerStats) StatsEq(b *ContainerStats) bool {
 		return false
 	}
 	return true
-}
-
-// Saturate CPU usage to 0.
-func calculateCpuUsage(prev, cur uint64) uint64 {
-	if prev > cur {
-		return 0
-	}
-	return cur - prev
 }
 
 // Event contains information general to events such as the time at which they

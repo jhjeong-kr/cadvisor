@@ -16,8 +16,13 @@ package statsd
 
 import (
 	info "github.com/google/cadvisor/info/v1"
+	"github.com/google/cadvisor/storage"
 	client "github.com/google/cadvisor/storage/statsd/client"
 )
+
+func init() {
+	storage.RegisterStorageDriver("statsd", new)
+}
 
 type statsdStorage struct {
 	client    *client.Client
@@ -26,6 +31,12 @@ type statsdStorage struct {
 
 const (
 	colCpuCumulativeUsage string = "cpu_cumulative_usage"
+	// CPU system
+	colCpuUsageSystem string = "cpu_usage_system"
+	// CPU user
+	colCpuUsageUser string = "cpu_usage_user"
+	// CPU average load
+	colCpuLoadAverage string = "cpu_load_average"
 	// Memory Usage
 	colMemoryUsage string = "memory_usage"
 	// Working set size
@@ -46,6 +57,10 @@ const (
 	colFsUsage = "fs_usage"
 )
 
+func new() (storage.StorageDriver, error) {
+	return newStorage(*storage.ArgDbName, *storage.ArgDbHost)
+}
+
 func (self *statsdStorage) containerStatsToValues(
 	stats *info.ContainerStats,
 ) (series map[string]uint64) {
@@ -53,6 +68,11 @@ func (self *statsdStorage) containerStatsToValues(
 
 	// Cumulative Cpu Usage
 	series[colCpuCumulativeUsage] = stats.Cpu.Usage.Total
+
+	// Cpu usage
+	series[colCpuUsageSystem] = stats.Cpu.Usage.System
+	series[colCpuUsageUser] = stats.Cpu.Usage.User
+	series[colCpuLoadAverage] = uint64(stats.Cpu.LoadAverage)
 
 	// Memory Usage
 	series[colMemoryUsage] = stats.Memory.Usage
@@ -114,7 +134,7 @@ func (self *statsdStorage) Close() error {
 	return nil
 }
 
-func New(namespace, hostPort string) (*statsdStorage, error) {
+func newStorage(namespace, hostPort string) (*statsdStorage, error) {
 	statsdClient, err := client.New(hostPort)
 	if err != nil {
 		return nil, err

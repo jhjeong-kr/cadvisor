@@ -17,26 +17,34 @@ package docker
 
 import (
 	"fmt"
-	"math"
+	"io/ioutil"
 	"path"
 	"strings"
 	"time"
 
-	"github.com/docker/libcontainer/cgroups"
-	cgroup_fs "github.com/docker/libcontainer/cgroups/fs"
-	libcontainerConfigs "github.com/docker/libcontainer/configs"
-	"github.com/fsouza/go-dockerclient"
 	"github.com/google/cadvisor/container"
-	containerLibcontainer "github.com/google/cadvisor/container/libcontainer"
+	"github.com/google/cadvisor/container/common"
+	containerlibcontainer "github.com/google/cadvisor/container/libcontainer"
+	"github.com/google/cadvisor/devicemapper"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
-	"github.com/google/cadvisor/utils"
+	dockerutil "github.com/google/cadvisor/utils/docker"
+
+	docker "github.com/docker/engine-api/client"
+	dockercontainer "github.com/docker/engine-api/types/container"
+	"github.com/golang/glog"
+	"github.com/opencontainers/runc/libcontainer/cgroups"
+	cgroupfs "github.com/opencontainers/runc/libcontainer/cgroups/fs"
+	libcontainerconfigs "github.com/opencontainers/runc/libcontainer/configs"
+	"golang.org/x/net/context"
 )
 
-// Path to aufs dir where all the files exist.
-// aufs/layers is ignored here since it does not hold a lot of data.
-// aufs/mnt contains the mount points used to compose the rootfs. Hence it is also ignored.
-var pathToAufsDir = "aufs/diff"
+const (
+	// The read write layers exist here.
+	aufsRWLayer = "diff"
+	// Path to the directory where docker stores log files if the json logging driver is enabled.
+	pathToContainersDir = "containers"
+)
 
 type dockerContainerHandler struct {
 	client             *docker.Client
@@ -45,16 +53,6 @@ type dockerContainerHandler struct {
 	aliases            []string
 	machineInfoFactory info.MachineInfoFactory
 
-	// Path to the libcontainer config file.
-	libcontainerConfigPath string
-
-	// Path to the libcontainer state file.
-	libcontainerStatePath string
-
-	// TODO(vmarmol): Remove when we depend on a newer Docker.
-	// Path to the libcontainer pid file.
-	libcontainerPidPath string
-
 	// Absolute path to the cgroup hierarchies of this container.
 	// (e.g.: "cpu" -> "/sys/fs/cgroup/cpu/test")
 	cgroupPaths map[string]string
@@ -62,24 +60,82 @@ type dockerContainerHandler struct {
 	// Manager of this container's cgroups.
 	cgroupManager cgroups.Manager
 
-	usesAufsDriver bool
-	fsInfo         fs.FsInfo
-	storageDirs    []string
+	// the docker storage driver
+	storageDriver    storageDriver
+	fsInfo           fs.FsInfo
+	rootfsStorageDir string
+
+	// devicemapper state
+
+	// the devicemapper poolname
+	poolName string
+	// the devicemapper device id for the container
+	deviceID string
 
 	// Time at which this container was created.
 	creationTime time.Time
 
-	// Metadata labels associated with the container.
+	// Metadata associated with the container.
 	labels map[string]string
+	envs   map[string]string
+
+	// The container PID used to switch namespaces as required
+	pid int
+
+	// Image name used for this container.
+	image string
+
+	// The host root FS to read
+	rootFs string
+
+	// The network mode of the container
+	networkMode dockercontainer.NetworkMode
+
+	// Filesystem handler.
+	fsHandler common.FsHandler
+
+	// The IP address of the container
+	ipAddress string
+
+	ignoreMetrics container.MetricSet
+
+	// thin pool watcher
+	thinPoolWatcher *devicemapper.ThinPoolWatcher
 }
 
+var _ container.ContainerHandler = &dockerContainerHandler{}
+
+func getRwLayerID(containerID, storageDir string, sd storageDriver, dockerVersion []int) (string, error) {
+	const (
+		// Docker version >=1.10.0 have a randomized ID for the root fs of a container.
+		randomizedRWLayerMinorVersion = 10
+		rwLayerIDFile                 = "mount-id"
+	)
+	if (dockerVersion[0] <= 1) && (dockerVersion[1] < randomizedRWLayerMinorVersion) {
+		return containerID, nil
+	}
+
+	bytes, err := ioutil.ReadFile(path.Join(storageDir, "image", string(sd), "layerdb", "mounts", containerID, rwLayerIDFile))
+	if err != nil {
+		return "", fmt.Errorf("failed to identify the read-write layer ID for container %q. - %v", containerID, err)
+	}
+	return string(bytes), err
+}
+
+// newDockerContainerHandler returns a new container.ContainerHandler
 func newDockerContainerHandler(
 	client *docker.Client,
 	name string,
 	machineInfoFactory info.MachineInfoFactory,
 	fsInfo fs.FsInfo,
-	usesAufsDriver bool,
-	cgroupSubsystems *containerLibcontainer.CgroupSubsystems,
+	storageDriver storageDriver,
+	storageDir string,
+	cgroupSubsystems *containerlibcontainer.CgroupSubsystems,
+	inHostNamespace bool,
+	metadataEnvs []string,
+	dockerVersion []int,
+	ignoreMetrics container.MetricSet,
+	thinPoolWatcher *devicemapper.ThinPoolWatcher,
 ) (container.ContainerHandler, error) {
 	// Create the cgroup paths.
 	cgroupPaths := make(map[string]string, len(cgroupSubsystems.MountPoints))
@@ -88,14 +144,50 @@ func newDockerContainerHandler(
 	}
 
 	// Generate the equivalent cgroup manager for this container.
-	cgroupManager := &cgroup_fs.Manager{
-		Cgroups: &libcontainerConfigs.Cgroup{
+	cgroupManager := &cgroupfs.Manager{
+		Cgroups: &libcontainerconfigs.Cgroup{
 			Name: name,
 		},
 		Paths: cgroupPaths,
 	}
 
+	rootFs := "/"
+	if !inHostNamespace {
+		rootFs = "/rootfs"
+		storageDir = path.Join(rootFs, storageDir)
+	}
+
 	id := ContainerNameToDockerId(name)
+
+	// Add the Containers dir where the log files are stored.
+	// FIXME: Give `otherStorageDir` a more descriptive name.
+	otherStorageDir := path.Join(storageDir, pathToContainersDir, id)
+
+	rwLayerID, err := getRwLayerID(id, storageDir, storageDriver, dockerVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	// Determine the rootfs storage dir OR the pool name to determine the device
+	var (
+		rootfsStorageDir string
+		poolName         string
+	)
+	switch storageDriver {
+	case aufsStorageDriver:
+		rootfsStorageDir = path.Join(storageDir, string(aufsStorageDriver), aufsRWLayer, rwLayerID)
+	case overlayStorageDriver:
+		rootfsStorageDir = path.Join(storageDir, string(overlayStorageDriver), rwLayerID)
+	case devicemapperStorageDriver:
+		status, err := Status()
+		if err != nil {
+			return nil, fmt.Errorf("unable to determine docker status: %v", err)
+		}
+
+		poolName = status.DriverStatus[dockerutil.DriverStatusPoolName]
+	}
+
+	// TODO: extract object mother method
 	handler := &dockerContainerHandler{
 		id:                 id,
 		client:             client,
@@ -103,134 +195,200 @@ func newDockerContainerHandler(
 		machineInfoFactory: machineInfoFactory,
 		cgroupPaths:        cgroupPaths,
 		cgroupManager:      cgroupManager,
-		usesAufsDriver:     usesAufsDriver,
+		storageDriver:      storageDriver,
 		fsInfo:             fsInfo,
+		rootFs:             rootFs,
+		poolName:           poolName,
+		rootfsStorageDir:   rootfsStorageDir,
+		envs:               make(map[string]string),
+		ignoreMetrics:      ignoreMetrics,
+		thinPoolWatcher:    thinPoolWatcher,
 	}
-	handler.storageDirs = append(handler.storageDirs, path.Join(*dockerRootDir, pathToAufsDir, id))
 
 	// We assume that if Inspect fails then the container is not known to docker.
-	ctnr, err := client.InspectContainer(id)
+	ctnr, err := client.ContainerInspect(context.Background(), id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to inspect container %q: %v", id, err)
 	}
-	handler.creationTime = ctnr.Created
+	// Timestamp returned by Docker is in time.RFC3339Nano format.
+	handler.creationTime, err = time.Parse(time.RFC3339Nano, ctnr.Created)
+	if err != nil {
+		// This should not happen, report the error just in case
+		return nil, fmt.Errorf("failed to parse the create timestamp %q for container %q: %v", ctnr.Created, id, err)
+	}
+	handler.pid = ctnr.State.Pid
 
 	// Add the name and bare ID as aliases of the container.
-	handler.aliases = append(handler.aliases, strings.TrimPrefix(ctnr.Name, "/"))
-	handler.aliases = append(handler.aliases, id)
+	handler.aliases = append(handler.aliases, strings.TrimPrefix(ctnr.Name, "/"), id)
 	handler.labels = ctnr.Config.Labels
+	handler.image = ctnr.Config.Image
+	handler.networkMode = ctnr.HostConfig.NetworkMode
+	handler.deviceID = ctnr.GraphDriver.Data["DeviceId"]
+
+	// Obtain the IP address for the contianer.
+	// If the NetworkMode starts with 'container:' then we need to use the IP address of the container specified.
+	// This happens in cases such as kubernetes where the containers doesn't have an IP address itself and we need to use the pod's address
+	ipAddress := ctnr.NetworkSettings.IPAddress
+	networkMode := string(ctnr.HostConfig.NetworkMode)
+	if ipAddress == "" && strings.HasPrefix(networkMode, "container:") {
+		containerId := strings.TrimPrefix(networkMode, "container:")
+		c, err := client.ContainerInspect(context.Background(), containerId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect container %q: %v", id, err)
+		}
+		ipAddress = c.NetworkSettings.IPAddress
+	}
+
+	handler.ipAddress = ipAddress
+
+	if !ignoreMetrics.Has(container.DiskUsageMetrics) {
+		handler.fsHandler = &dockerFsHandler{
+			fsHandler:       common.NewFsHandler(time.Minute, rootfsStorageDir, otherStorageDir, fsInfo),
+			thinPoolWatcher: thinPoolWatcher,
+			deviceID:        handler.deviceID,
+		}
+	}
+
+	// split env vars to get metadata map.
+	for _, exposedEnv := range metadataEnvs {
+		for _, envVar := range ctnr.Config.Env {
+			splits := strings.SplitN(envVar, "=", 2)
+			if splits[0] == exposedEnv {
+				handler.envs[strings.ToLower(exposedEnv)] = splits[1]
+			}
+		}
+	}
 
 	return handler, nil
 }
 
+// dockerFsHandler is a composite FsHandler implementation the incorporates
+// the common fs handler and a devicemapper ThinPoolWatcher.
+type dockerFsHandler struct {
+	fsHandler common.FsHandler
+
+	// thinPoolWatcher is the devicemapper thin pool watcher
+	thinPoolWatcher *devicemapper.ThinPoolWatcher
+	// deviceID is the id of the container's fs device
+	deviceID string
+}
+
+var _ common.FsHandler = &dockerFsHandler{}
+
+func (h *dockerFsHandler) Start() {
+	h.fsHandler.Start()
+}
+
+func (h *dockerFsHandler) Stop() {
+	h.fsHandler.Stop()
+}
+
+func (h *dockerFsHandler) Usage() (uint64, uint64) {
+	baseUsage, usage := h.fsHandler.Usage()
+
+	// When devicemapper is the storage driver, the base usage of the container comes from the thin pool.
+	// We still need the result of the fsHandler for any extra storage associated with the container.
+	// To correctly factor in the thin pool usage, we should:
+	// * Usage the thin pool usage as the base usage
+	// * Calculate the overall usage by adding the overall usage from the fs handler to the thin pool usage
+	if h.thinPoolWatcher != nil {
+		thinPoolUsage, err := h.thinPoolWatcher.GetUsage(h.deviceID)
+		if err != nil {
+			// TODO: ideally we should keep track of how many times we failed to get the usage for this
+			// device vs how many refreshes of the cache there have been, and display an error e.g. if we've
+			// had at least 1 refresh and we still can't find the device.
+			glog.V(5).Infof("unable to get fs usage from thin pool for device %s: %v", h.deviceID, err)
+		} else {
+			baseUsage = thinPoolUsage
+			usage += thinPoolUsage
+		}
+	}
+
+	return baseUsage, usage
+}
+
+func (self *dockerContainerHandler) Start() {
+	if self.fsHandler != nil {
+		self.fsHandler.Start()
+	}
+}
+
+func (self *dockerContainerHandler) Cleanup() {
+	if self.fsHandler != nil {
+		self.fsHandler.Stop()
+	}
+}
+
 func (self *dockerContainerHandler) ContainerReference() (info.ContainerReference, error) {
 	return info.ContainerReference{
+		Id:        self.id,
 		Name:      self.name,
 		Aliases:   self.aliases,
 		Namespace: DockerNamespace,
+		Labels:    self.labels,
 	}, nil
 }
 
-func (self *dockerContainerHandler) readLibcontainerConfig() (*libcontainerConfigs.Config, error) {
-	config, err := containerLibcontainer.ReadConfig(*dockerRootDir, *dockerRunDir, self.id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read libcontainer config: %v", err)
+func (self *dockerContainerHandler) needNet() bool {
+	if !self.ignoreMetrics.Has(container.NetworkUsageMetrics) {
+		return !self.networkMode.IsContainer()
 	}
-
-	// Replace cgroup parent and name with our own since we may be running in a different context.
-	if config.Cgroups == nil {
-		config.Cgroups = new(libcontainerConfigs.Cgroup)
-	}
-	config.Cgroups.Name = self.name
-	config.Cgroups.Parent = "/"
-
-	return config, nil
-}
-
-func libcontainerConfigToContainerSpec(config *libcontainerConfigs.Config, mi *info.MachineInfo) info.ContainerSpec {
-	var spec info.ContainerSpec
-	spec.HasMemory = true
-	spec.Memory.Limit = math.MaxUint64
-	spec.Memory.SwapLimit = math.MaxUint64
-	if config.Cgroups.Memory > 0 {
-		spec.Memory.Limit = uint64(config.Cgroups.Memory)
-	}
-	if config.Cgroups.MemorySwap > 0 {
-		spec.Memory.SwapLimit = uint64(config.Cgroups.MemorySwap)
-	}
-
-	// Get CPU info
-	spec.HasCpu = true
-	spec.Cpu.Limit = 1024
-	if config.Cgroups.CpuShares != 0 {
-		spec.Cpu.Limit = uint64(config.Cgroups.CpuShares)
-	}
-	spec.Cpu.Mask = utils.FixCpuMask(config.Cgroups.CpusetCpus, mi.NumCores)
-
-	spec.HasNetwork = len(config.Networks) > 0
-	spec.HasDiskIo = true
-
-	return spec
+	return false
 }
 
 func (self *dockerContainerHandler) GetSpec() (info.ContainerSpec, error) {
-	mi, err := self.machineInfoFactory.GetMachineInfo()
-	if err != nil {
-		return info.ContainerSpec{}, err
-	}
-	libcontainerConfig, err := self.readLibcontainerConfig()
-	if err != nil {
-		return info.ContainerSpec{}, err
-	}
+	hasFilesystem := !self.ignoreMetrics.Has(container.DiskUsageMetrics)
+	spec, err := common.GetSpec(self.cgroupPaths, self.machineInfoFactory, self.needNet(), hasFilesystem)
 
-	spec := libcontainerConfigToContainerSpec(libcontainerConfig, mi)
-	spec.CreationTime = self.creationTime
-	if self.usesAufsDriver {
-		spec.HasFilesystem = true
-	}
 	spec.Labels = self.labels
+	spec.Envs = self.envs
+	spec.Image = self.image
 
 	return spec, err
 }
 
 func (self *dockerContainerHandler) getFsStats(stats *info.ContainerStats) error {
-	// No support for non-aufs storage drivers.
-	if !self.usesAufsDriver {
+	if self.ignoreMetrics.Has(container.DiskUsageMetrics) {
 		return nil
 	}
-
-	// As of now we assume that all the storage dirs are on the same device.
-	// The first storage dir will be that of the image layers.
-	deviceInfo, err := self.fsInfo.GetDirFsDevice(self.storageDirs[0])
-	if err != nil {
-		return err
+	var device string
+	switch self.storageDriver {
+	case devicemapperStorageDriver:
+		// Device has to be the pool name to correlate with the device name as
+		// set in the machine info filesystems.
+		device = self.poolName
+	case aufsStorageDriver, overlayStorageDriver, zfsStorageDriver:
+		deviceInfo, err := self.fsInfo.GetDirFsDevice(self.rootfsStorageDir)
+		if err != nil {
+			return fmt.Errorf("unable to determine device info for dir: %v: %v", self.rootfsStorageDir, err)
+		}
+		device = deviceInfo.Device
+	default:
+		return nil
 	}
 
 	mi, err := self.machineInfoFactory.GetMachineInfo()
 	if err != nil {
 		return err
 	}
-	var limit uint64 = 0
+
+	var (
+		limit  uint64
+		fsType string
+	)
+
 	// Docker does not impose any filesystem limits for containers. So use capacity as limit.
 	for _, fs := range mi.Filesystems {
-		if fs.Device == deviceInfo.Device {
+		if fs.Device == device {
 			limit = fs.Capacity
+			fsType = fs.Type
 			break
 		}
 	}
 
-	fsStat := info.FsStats{Device: deviceInfo.Device, Limit: limit}
+	fsStat := info.FsStats{Device: device, Type: fsType, Limit: limit}
+	fsStat.BaseUsage, fsStat.Usage = self.fsHandler.Usage()
 
-	var usage uint64 = 0
-	for _, dir := range self.storageDirs {
-		// TODO(Vishh): Add support for external mounts.
-		dirUsage, err := self.fsInfo.GetDirUsage(dir)
-		if err != nil {
-			return err
-		}
-		usage += dirUsage
-	}
-	fsStat.Usage = usage
 	stats.Filesystem = append(stats.Filesystem, fsStat)
 
 	return nil
@@ -238,32 +396,16 @@ func (self *dockerContainerHandler) getFsStats(stats *info.ContainerStats) error
 
 // TODO(vmarmol): Get from libcontainer API instead of cgroup manager when we don't have to support older Dockers.
 func (self *dockerContainerHandler) GetStats() (*info.ContainerStats, error) {
-	config, err := self.readLibcontainerConfig()
-	if err != nil {
-		return nil, err
-	}
-
-	var networkInterfaces []string
-	if len(config.Networks) > 0 {
-		// ContainerStats only reports stat for one network device.
-		// TODO(vmarmol): Handle multiple physical network devices.
-		for _, n := range config.Networks {
-			// Take the first non-loopback.
-			if n.Type != "loopback" {
-				networkInterfaces = []string{n.HostInterfaceName}
-				break
-			}
-		}
-	}
-	stats, err := containerLibcontainer.GetStats(self.cgroupManager, networkInterfaces)
+	stats, err := containerlibcontainer.GetStats(self.cgroupManager, self.rootFs, self.pid, self.ignoreMetrics)
 	if err != nil {
 		return stats, err
 	}
-
-	// TODO(rjnagal): Remove the conversion when network stats are read from libcontainer.
-	convertInterfaceStats(&stats.Network.InterfaceStats)
-	for i := range stats.Network.Interfaces {
-		convertInterfaceStats(&stats.Network.Interfaces[i])
+	// Clean up stats for containers that don't have their own network - this
+	// includes containers running in Kubernetes pods that use the network of the
+	// infrastructure container. This stops metrics being reported multiple times
+	// for each container in a pod.
+	if !self.needNet() {
+		stats.Network = info.NetworkStats{}
 	}
 
 	// Get filesystem stats.
@@ -275,48 +417,9 @@ func (self *dockerContainerHandler) GetStats() (*info.ContainerStats, error) {
 	return stats, nil
 }
 
-func convertInterfaceStats(stats *info.InterfaceStats) {
-	net := *stats
-
-	// Ingress for host veth is from the container.
-	// Hence tx_bytes stat on the host veth is actually number of bytes received by the container.
-	stats.RxBytes = net.TxBytes
-	stats.RxPackets = net.TxPackets
-	stats.RxErrors = net.TxErrors
-	stats.RxDropped = net.TxDropped
-	stats.TxBytes = net.RxBytes
-	stats.TxPackets = net.RxPackets
-	stats.TxErrors = net.RxErrors
-	stats.TxDropped = net.RxDropped
-}
-
 func (self *dockerContainerHandler) ListContainers(listType container.ListType) ([]info.ContainerReference, error) {
-	if self.name != "/docker" {
-		return []info.ContainerReference{}, nil
-	}
-	opt := docker.ListContainersOptions{
-		All: true,
-	}
-	containers, err := self.client.ListContainers(opt)
-	if err != nil {
-		return nil, err
-	}
-
-	ret := make([]info.ContainerReference, 0, len(containers)+1)
-	for _, c := range containers {
-		if !strings.HasPrefix(c.Status, "Up ") {
-			continue
-		}
-
-		ref := info.ContainerReference{
-			Name:      FullContainerName(c.ID),
-			Aliases:   append(c.Names, c.ID),
-			Namespace: DockerNamespace,
-		}
-		ret = append(ret, ref)
-	}
-
-	return ret, nil
+	// No-op for Docker driver.
+	return []info.ContainerReference{}, nil
 }
 
 func (self *dockerContainerHandler) GetCgroupPath(resource string) (string, error) {
@@ -327,52 +430,22 @@ func (self *dockerContainerHandler) GetCgroupPath(resource string) (string, erro
 	return path, nil
 }
 
-func (self *dockerContainerHandler) ListThreads(listType container.ListType) ([]int, error) {
-	// TODO(vmarmol): Implement.
-	return nil, nil
-}
-
 func (self *dockerContainerHandler) GetContainerLabels() map[string]string {
 	return self.labels
 }
 
+func (self *dockerContainerHandler) GetContainerIPAddress() string {
+	return self.ipAddress
+}
+
 func (self *dockerContainerHandler) ListProcesses(listType container.ListType) ([]int, error) {
-	return containerLibcontainer.GetProcesses(self.cgroupManager)
-}
-
-func (self *dockerContainerHandler) WatchSubcontainers(events chan container.SubcontainerEvent) error {
-	return fmt.Errorf("watch is unimplemented in the Docker container driver")
-}
-
-func (self *dockerContainerHandler) StopWatchingSubcontainers() error {
-	// No-op for Docker driver.
-	return nil
+	return containerlibcontainer.GetProcesses(self.cgroupManager)
 }
 
 func (self *dockerContainerHandler) Exists() bool {
-	return containerLibcontainer.Exists(*dockerRootDir, *dockerRunDir, self.id)
+	return common.CgroupExists(self.cgroupPaths)
 }
 
-func DockerInfo() (map[string]string, error) {
-	client, err := docker.NewClient(*ArgDockerEndpoint)
-	if err != nil {
-		return nil, fmt.Errorf("unable to communicate with docker daemon: %v", err)
-	}
-	info, err := client.Info()
-	if err != nil {
-		return nil, err
-	}
-	return info.Map(), nil
-}
-
-func DockerImages() ([]docker.APIImages, error) {
-	client, err := docker.NewClient(*ArgDockerEndpoint)
-	if err != nil {
-		return nil, fmt.Errorf("unable to communicate with docker daemon: %v", err)
-	}
-	images, err := client.ListImages(docker.ListImagesOptions{All: false})
-	if err != nil {
-		return nil, err
-	}
-	return images, nil
+func (self *dockerContainerHandler) Type() container.ContainerType {
+	return container.ContainerTypeDocker
 }

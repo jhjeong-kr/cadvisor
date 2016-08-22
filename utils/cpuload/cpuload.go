@@ -17,8 +17,9 @@ package cpuload
 import (
 	"fmt"
 
-	"github.com/golang/glog"
 	info "github.com/google/cadvisor/info/v1"
+
+	"github.com/golang/glog"
 	"github.com/google/cadvisor/utils/cpuload/netlink"
 )
 
@@ -40,6 +41,6 @@ func New() (CpuLoadReader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create a netlink based cpuload reader: %v", err)
 	}
-	glog.Info("Using a netlink-based load reader")
+	glog.V(3).Info("Using a netlink-based load reader")
 	return reader, nil
 }

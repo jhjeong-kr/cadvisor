@@ -36,6 +36,10 @@ type CpuSpec struct {
 	// Cpu affinity mask.
 	// TODO(rjnagal): Add a library to convert mask string to set of cpu bitmask.
 	Mask string `json:"mask,omitempty"`
+	// CPUQuota Default is disabled
+	Quota uint64 `json:"quota,omitempty"`
+	// Period is the CPU reference time in ns e.g the quota is compared aginst this.
+	Period uint64 `json:"period,omitempty"`
 }
 
 type MemorySpec struct {
@@ -52,6 +56,14 @@ type MemorySpec struct {
 	SwapLimit uint64 `json:"swap_limit,omitempty"`
 }
 
+type ContainerInfo struct {
+	// Describes the container.
+	Spec ContainerSpec `json:"spec,omitempty"`
+
+	// Historical statistics gathered from the container.
+	Stats []*ContainerStats `json:"stats,omitempty"`
+}
+
 type ContainerSpec struct {
 	// Time at which the container was created.
 	CreationTime time.Time `json:"creation_time,omitempty"`
@@ -66,6 +78,8 @@ type ContainerSpec struct {
 
 	// Metadata labels associated with this container.
 	Labels map[string]string `json:"labels,omitempty"`
+	// Metadata envs associated with this container. Only whitelisted envs are added.
+	Envs map[string]string `json:"envs,omitempty"`
 
 	HasCpu bool    `json:"has_cpu"`
 	Cpu    CpuSpec `json:"cpu,omitempty"`
@@ -80,14 +94,20 @@ type ContainerSpec struct {
 	HasNetwork    bool `json:"has_network"`
 	HasFilesystem bool `json:"has_filesystem"`
 	HasDiskIo     bool `json:"has_diskio"`
+
+	// Image name used for this container.
+	Image string `json:"image,omitempty"`
 }
 
-type ContainerStats struct {
+type DeprecatedContainerStats struct {
 	// The time of this stat point.
 	Timestamp time.Time `json:"timestamp"`
 	// CPU statistics
-	HasCpu bool        `json:"has_cpu"`
-	Cpu    v1.CpuStats `json:"cpu,omitempty"`
+	HasCpu bool `json:"has_cpu"`
+	// In nanoseconds (aggregated)
+	Cpu v1.CpuStats `json:"cpu,omitempty"`
+	// In nanocores per second (instantaneous)
+	CpuInst *CpuInstStats `json:"cpu_inst,omitempty"`
 	// Disk IO statistics
 	HasDiskIo bool           `json:"has_diskio"`
 	DiskIo    v1.DiskIoStats `json:"diskio,omitempty"`
@@ -106,6 +126,28 @@ type ContainerStats struct {
 	// Custom Metrics
 	HasCustomMetrics bool                      `json:"has_custom_metrics"`
 	CustomMetrics    map[string][]v1.MetricVal `json:"custom_metrics,omitempty"`
+}
+
+type ContainerStats struct {
+	// The time of this stat point.
+	Timestamp time.Time `json:"timestamp"`
+	// CPU statistics
+	// In nanoseconds (aggregated)
+	Cpu *v1.CpuStats `json:"cpu,omitempty"`
+	// In nanocores per second (instantaneous)
+	CpuInst *CpuInstStats `json:"cpu_inst,omitempty"`
+	// Disk IO statistics
+	DiskIo *v1.DiskIoStats `json:"diskio,omitempty"`
+	// Memory statistics
+	Memory *v1.MemoryStats `json:"memory,omitempty"`
+	// Network statistics
+	Network *NetworkStats `json:"network,omitempty"`
+	// Filesystem statistics
+	Filesystem *FilesystemStats `json:"filesystem,omitempty"`
+	// Task load statistics
+	Load *v1.LoadStats `json:"load_stats,omitempty"`
+	// Custom Metrics
+	CustomMetrics map[string][]v1.MetricVal `json:"custom_metrics,omitempty"`
 }
 
 type Percentiles struct {
@@ -174,6 +216,12 @@ type FsInfo struct {
 
 	// Labels associated with this filesystem.
 	Labels []string `json:"labels"`
+
+	// Number of Inodes.
+	Inodes *uint64 `json:"inodes,omitempty"`
+
+	// Number of available Inodes (if known)
+	InodesFree *uint64 `json:"inodes_free,omitempty"`
 }
 
 type RequestOptions struct {
@@ -200,7 +248,57 @@ type ProcessInfo struct {
 	Cmd           string  `json:"cmd"`
 }
 
+type TcpStat struct {
+	Established uint64
+	SynSent     uint64
+	SynRecv     uint64
+	FinWait1    uint64
+	FinWait2    uint64
+	TimeWait    uint64
+	Close       uint64
+	CloseWait   uint64
+	LastAck     uint64
+	Listen      uint64
+	Closing     uint64
+}
+
 type NetworkStats struct {
 	// Network stats by interface.
 	Interfaces []v1.InterfaceStats `json:"interfaces,omitempty"`
+	// TCP connection stats (Established, Listen...)
+	Tcp TcpStat `json:"tcp"`
+	// TCP6 connection stats (Established, Listen...)
+	Tcp6 TcpStat `json:"tcp6"`
+}
+
+// Instantaneous CPU stats
+type CpuInstStats struct {
+	Usage CpuInstUsage `json:"usage"`
+}
+
+// CPU usage time statistics.
+type CpuInstUsage struct {
+	// Total CPU usage.
+	// Units: nanocores per second
+	Total uint64 `json:"total"`
+
+	// Per CPU/core usage of the container.
+	// Unit: nanocores per second
+	PerCpu []uint64 `json:"per_cpu_usage,omitempty"`
+
+	// Time spent in user space.
+	// Unit: nanocores per second
+	User uint64 `json:"user"`
+
+	// Time spent in kernel space.
+	// Unit: nanocores per second
+	System uint64 `json:"system"`
+}
+
+// Filesystem usage statistics.
+type FilesystemStats struct {
+	// Total Number of bytes consumed by container.
+	TotalUsageBytes *uint64 `json:"totalUsageBytes,omitempty"`
+	// Number of bytes consumed by a container through its root filesystem.
+	BaseUsageBytes *uint64 `json:"baseUsageBytes,omitempty"`
 }

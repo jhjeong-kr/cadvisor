@@ -16,7 +16,7 @@ Housekeeping is the periodic actions cAdvisor takes. During these actions, cAdvi
 
 #### Dynamic Housekeeping
 
-Dynamic housekeeping intervals let cAdvisor very how often it gathers stats.
+Dynamic housekeeping intervals let cAdvisor vary how often it gathers stats.
 It does this depending on how active the container is. Turning this off
 provides predictable housekeeping intervals, but increases the resource usage
 of cAdvisor.
@@ -62,6 +62,7 @@ cAdvisor-native flags that help in debugging:
 ```
 --log_cadvisor_usage=false: Whether to log the usage of the cAdvisor container
 --version=false: print cAdvisor version and exit
+--profiling=false: Enable profiling via web interface host:port/debug/pprof/
 ```
 
 From [glog](https://github.com/golang/glog) here are some flags we find useful:
@@ -77,4 +78,4 @@ From [glog](https://github.com/golang/glog) here are some flags we find useful:
 
 ## Storage Drivers
 
-See [InfluxDB instructions](influxdb.md).
+See [InfluxDB instructions](storage/influxdb.md).
